@@ -476,14 +476,14 @@ class ThoughtDetector:
         C.fill_diagonal_(0)
 
         # Binary graph
-        G = (C > self.threshold).cpu().numpy()
+        G = (C > self.threshold).cpu().tolist()
 
         # Connected components via BFS
         visited    = [False] * self.N
         assemblies = []
 
         for start in range(self.N):
-            if visited[start] or not G[start].any():
+            if visited[start] or not any(G[start]):
                 continue
             component = []
             queue     = [start]
@@ -493,7 +493,7 @@ class ThoughtDetector:
                     continue
                 visited[node] = True
                 component.append(node)
-                neighbors = np.where(G[node])[0]
+                neighbors = [i for i, val in enumerate(G[node]) if val]
                 queue.extend([n for n in neighbors if not visited[n]])
 
             if len(component) >= 3:   # min assembly size
