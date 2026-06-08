@@ -1,3 +1,32 @@
+Metadata-Version: 2.4
+Name: bioneuron
+Version: 1.5.0
+Summary: Biologically accurate spiking neural network — STDP, neurochemistry, and closed-loop reinforcement learning
+Author: Jugal Kishore Nagulapalli
+License: MIT
+Keywords: spiking neural network,SNN,STDP,neuroscience,computational neuroscience,neuromorphic,reinforcement learning,neurochemistry,plasticity
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Scientific/Engineering :: Bio-Informatics
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch>=2.0
+Requires-Dist: numpy>=1.21
+Provides-Extra: viz
+Requires-Dist: matplotlib>=3.5; extra == "viz"
+Provides-Extra: dev
+Requires-Dist: build; extra == "dev"
+Requires-Dist: pytest; extra == "dev"
+Dynamic: license-file
+
 # BioNeuron — Biologically Accurate Spiking Neural Network
 
 A from-scratch implementation of a cortical spiking neural network where each neuron operates on real biophysical principles — no backpropagation, no gradient descent. Learning is driven entirely by **Spike-Timing Dependent Plasticity (STDP)**, and connectivity is self-organized through **activity-dependent axon growth**.
@@ -131,34 +160,20 @@ Most "biologically inspired" networks are just MLPs with a renamed activation fu
 
 ---
 
-## Installation
-
-The project is a pip-installable package (`bioneuron`). From the repo root:
+## Requirements
 
 ```bash
-pip install -e ohToBeAlive          # editable / development install
-# or build distributables for PyPI:
-pip install build twine
-python -m build ohToBeAlive         # creates dist/*.whl and *.tar.gz
+pip install torch numpy matplotlib
 ```
-
-Dependencies: `torch>=2.0`, `numpy>=1.21` (plus `matplotlib` for the notebook visuals, via the `viz` extra). A console entry point is installed:
-
-```bash
-bioneuron version
-bioneuron demo conditioning --trials 150
-```
-
-> The importable package is `bioneuron`; the source still lives in `src/` (mapped via `pyproject.toml`). If the name `bioneuron` is taken on PyPI, change `name` in `pyproject.toml`.
 
 ---
 
 ## Quickstart
 
 ```python
-from bioneuron import BrainNet, default_neurochemistry   # or: from core import BrainNet (flat)
+from core import BrainNet
 
-brain = BrainNet(N=300, neurochem=default_neurochemistry())
+brain = BrainNet(N=300)
 
 for t in range(5000):
     spikes, state = brain.step(dt=1e-4)

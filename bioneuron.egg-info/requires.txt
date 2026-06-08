@@ -1,0 +1,9 @@
+torch>=2.0
+numpy>=1.21
+
+[dev]
+build
+pytest
+
+[viz]
+matplotlib>=3.5
