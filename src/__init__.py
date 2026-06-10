@@ -11,7 +11,7 @@ the neurochemical system (`neurochemistry`) and the closed-loop learning harness
 (`closed_loop`) are all re-exported here. See the README for the full guide.
 """
 
-__version__ = "1.5.0"
+__version__ = "1.8.0"
 __author__ = "Jugal Kishore"
 
 from .core import (
@@ -41,6 +41,14 @@ from .closed_loop import (
     demo_conditioning,
     demo_discrimination,
 )
+from .cortex import (
+    CellType,
+    RS, FS, LTS,
+    build_cortex,
+    demo_gamma,
+    excitatory_indices,
+    fast_spiking_indices,
+)
 
 __all__ = [
     "__version__",
@@ -55,4 +63,7 @@ __all__ = [
     "stressed", "drowsy", "aroused",
     # closed loop
     "ClosedLoop", "accuracy_curve", "demo_conditioning", "demo_discrimination",
+    # structured cortex
+    "CellType", "RS", "FS", "LTS", "build_cortex", "demo_gamma",
+    "excitatory_indices", "fast_spiking_indices",
 ]

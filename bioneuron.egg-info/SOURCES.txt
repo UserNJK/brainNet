@@ -12,5 +12,7 @@ src/awareness_battery.py
 src/cli.py
 src/closed_loop.py
 src/core.py
+src/cortex.py
 src/neurochemistry.py
 src/sparse_synapses.py
+tests/test_bioneuron.py

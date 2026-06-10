@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: bioneuron
-Version: 1.5.0
+Version: 1.8.0
 Summary: Biologically accurate spiking neural network — STDP, neurochemistry, and closed-loop reinforcement learning
 Author: Jugal Kishore Nagulapalli
 License: MIT
@@ -100,6 +100,10 @@ Several mechanisms are configurable on `NeuronParams`. Adaptation is on by defau
 | `enable_homeostasis` | `False` | Homeostatic synaptic scaling toward `target_rate_hz` |
 | `enable_stp` | `False` | Short-term plasticity (`U_stp`, `tau_rec`, `tau_facil`); defaults to a facilitating synapse |
 | `enable_nmda` | `False` | Slow voltage-gated NMDA conductance (`tau_nmda`, `nmda_ratio`, `Mg`) |
+| `enable_exp` | `False` | AdEx exponential spike-initiation term (`delta_T`, `V_T`) — sharp upstroke + tonic/adapting/bursting firing patterns |
+| `enable_istdp` | `False` | Inhibitory STDP (Vogels 2011) — inhibition learns to balance excitation toward `rho_target` Hz |
+| `enable_gap` | `False` | Gap junctions / electrical synapses (`g_gap`); wired among FS interneurons by `cortex.py` |
+| `enable_dendrite` | `False` | Two-compartment neuron: excitation (+NMDA) charges a separate active dendrite with regenerative spikes (`tau_d`, `g_couple`, `V_d_thresh`, `dend_plateau`) → supralinear dendritic computation |
 | `noise_sqrt_dt` | `False` | Proper Euler–Maruyama (√dt) noise scaling — modest `noise_std` then drives realistic spontaneous activity |
 | `sparse_synapses` | `False` | Edge-list connectivity backend (O(E) memory/compute) instead of the dense `[N,N]` matrix — scales past the few-thousand-neuron ceiling |
 | `enable_reward_learning` | `False` | Three-factor reward/stress learning: eligibility traces gated by dopamine (`reward()`) and cortisol (`punish()`) — see below |
@@ -120,6 +124,7 @@ The package is split so heavy users can compose and extend pieces independently:
 | [`sparse_synapses.py`](src/sparse_synapses.py) | Edge-list connectivity backend for scaling past the dense `[N,N]` ceiling (`sparse_synapses=True`) |
 | [`neurochemistry.py`](src/neurochemistry.py) | Extensible neurochemical system (below) |
 | [`closed_loop.py`](src/closed_loop.py) | Closed-loop task harness — learning from self-generated feedback (below) |
+| [`cortex.py`](src/cortex.py) | Cell types (fast-spiking interneurons) + cortical E–I microcircuit → gamma (below) |
 
 ### Neurochemistry
 
@@ -150,7 +155,23 @@ early, late, log = demo_conditioning(n_trials=150)   # ≈0.30 → 1.00 response
 
 `demo_conditioning` (operant conditioning, Fetz 1969) reliably learns: the network is rewarded when its own target output crosses threshold, and reward-gated plasticity ratchets that pathway up until it responds on cue. Requires `enable_reward_learning=True`.
 
-> Two findings worth knowing. (1) **Reward-only vs. reward+punish:** because the learning signal is `M = (dopamine−1) − cortisol` and cortisol clears slowly, frequent errors keep cortisol elevated and *cancel* subsequent reward — a realistic "chronic stress blocks reward learning" effect, so simple conditioning uses positive reinforcement only. (2) `demo_discrimination` (2-alternative forced choice) currently sits at chance from scratch: without winner-take-all competition the output groups co-fire, so reward and punishment tag the same eligible synapses and cancel. Adding lateral inhibition between output groups is the next step.
+`demo_discrimination` learns a 2-alternative forced choice (climbing to **~0.85** accuracy) once three ingredients are combined: **winner-take-all** lateral inhibition between output groups (so only the winner is eligible), a dopamine **reward-prediction-error** baseline (so correct/wrong don't cancel), and a dedicated plastic **input→output projection** (so credit isn't buried in recurrent noise). It then shows a late instability typical of unregulated R-STDP — `enable_homeostasis=True` is the intended stabilizer.
+
+> Two findings worth knowing. (1) **Reward-only vs. reward+punish:** because the learning signal is `M = (dopamine−1) − cortisol` and cortisol clears slowly, frequent errors keep cortisol elevated and *cancel* subsequent reward — a realistic "chronic stress blocks reward learning" effect, so simple conditioning uses positive reinforcement only. (2) For trial-by-trial RL the wrong-signal is better modeled as a fast dopamine *dip* (RPE) than as slow cortisol — see `feedback(..., use_cortisol=False)`.
+
+### Structured Cortex
+
+`cortex.py` replaces the homogeneous random soup with a model of cortex: distinct **cell types** (each with its own intrinsic dynamics — fast-spiking PV⁺ interneurons are fast and non-adapting, regular-spiking pyramidal cells are slow and strongly adapting) wired by the canonical **E–I microcircuit**, optionally in **columns**.
+
+```python
+from cortex import build_cortex, demo_gamma
+brain = build_cortex(N=800, columns=4)
+demo_gamma()   # drive the excitatory cells → a gamma-band rhythm emerges
+```
+
+The payoff is biological: fast feedback inhibition from FS interneurons generates **gamma oscillations via the PING mechanism** (Cardin et al. 2009) — measured by the `OscillationAnalyzer` as a dominant gamma band, with FS interneurons firing at ~160 Hz vs ~54 Hz for pyramidal cells. This is the first emergent rhythm a random network cannot produce. Per-neuron heterogeneity is exposed generally via `NeuronPopulation.set_cell_params(...)`.
+
+See [`docs/RESULTS.md`](docs/RESULTS.md) for the full test record and [`docs/HARDWARE.md`](docs/HARDWARE.md) for the scaling / "what hardware runs a bare consciousness" analysis.
 
 ---
 
@@ -160,20 +181,34 @@ Most "biologically inspired" networks are just MLPs with a renamed activation fu
 
 ---
 
-## Requirements
+## Installation
+
+The project is a pip-installable package (`bioneuron`). From the repo root:
 
 ```bash
-pip install torch numpy matplotlib
+pip install -e ohToBeAlive          # editable / development install
+# or build distributables for PyPI:
+pip install build twine
+python -m build ohToBeAlive         # creates dist/*.whl and *.tar.gz
 ```
+
+Dependencies: `torch>=2.0`, `numpy>=1.21` (plus `matplotlib` for the notebook visuals, via the `viz` extra). A console entry point is installed:
+
+```bash
+bioneuron version
+bioneuron demo conditioning --trials 150
+```
+
+> The importable package is `bioneuron`; the source still lives in `src/` (mapped via `pyproject.toml`). If the name `bioneuron` is taken on PyPI, change `name` in `pyproject.toml`.
 
 ---
 
 ## Quickstart
 
 ```python
-from core import BrainNet
+from bioneuron import BrainNet, default_neurochemistry   # or: from core import BrainNet (flat)
 
-brain = BrainNet(N=300)
+brain = BrainNet(N=300, neurochem=default_neurochemistry())
 
 for t in range(5000):
     spikes, state = brain.step(dt=1e-4)
@@ -198,6 +233,9 @@ print(brain.get_thoughts())  # current cell assemblies
 - Beggs & Plenz (2003) — Neuronal avalanches / self-organized criticality
 - Softky & Koch (1993); Brunel (2000) — Irregular firing & the asynchronous-irregular cortical state
 - Buzsáki & Draguhn (2004) — Neuronal oscillations in cortical networks
+- Cardin et al. (2009); Buzsáki & Wang (2012) — Fast-spiking interneurons and gamma (PING)
+- Naud et al. (2008) — AdEx firing patterns; Vogels et al. (2011) — Inhibitory plasticity & E/I balance; Galarreta & Hestrin (1999) — Electrical synapses between interneurons
+- Poirazi & Mel (2003); Larkum (2013); Polsky et al. (2004) — Dendritic computation, dendritic spikes, supralinear summation
 - Schultz et al. (1997) — Dopamine reward prediction error
 - Frémaux & Gerstner (2016); Izhikevich (2007); Legenstein et al. (2008) — Three-factor / reward-modulated STDP, eligibility traces, closed-loop reinforcement
 - Joëls & Krugers (2007) — Stress, glucocorticoids (cortisol) and synaptic plasticity

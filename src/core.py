@@ -32,9 +32,16 @@ Companion modules (compose with this one):
   sparse_synapses.py → edge-list backend to scale past the dense [N,N] ceiling
   neurochemistry.py  → extensible neurochemical system (drop-in for the modulator)
   closed_loop.py     → learning from self-generated feedback (closed reward loop)
+  cortex.py          → cell types (FS interneurons) + cortical microcircuit (gamma)
+
+Single-neuron model: leaky integrate-and-fire, optionally Adaptive Exponential
+(AdEx) with spike-frequency adaptation, NMDA, gap junctions, two-compartment
+active dendrites, and per-neuron cell-type heterogeneity. Plasticity: STDP,
+inhibitory STDP, short-term plasticity, homeostatic scaling, and three-factor
+reward/stress learning.
 
 Author  : Jugal Kishore
-Version : 1.5.0
+Version : 1.8.0
 """
 
 import torch
@@ -109,6 +116,15 @@ class NeuronParams:
     b_adapt              : float =  0.04   # spike-triggered adaptation increment
     tau_w                : float = 120.0   # adaptation current time constant (ms)
 
+    # ── Exponential spike initiation (Adaptive Exponential I&F; Brette & Gerstner 2005) ──
+    # Adds the sharp voltage-dependent upstroke term (Δ_T/τ_m)·exp((V−V_T)/Δ_T),
+    # promoting the adaptive-LIF to the standard AdEx model. Combined with the
+    # adaptation parameters it reproduces tonic / adapting / bursting / initial-
+    # burst firing (Naud et al. 2008). Spikes are detected at V_peak. Opt-in.
+    enable_exp           : bool  = False
+    delta_T              : float =   2.0   # spike slope factor (mV)
+    V_T                  : float = -55.0   # soft threshold for the exponential (mV)
+
     # ── Conductance-based synapses (reversal potentials) ──
     # If True : I_syn = g_e*(E_exc - V) + g_i*(E_inh - V)  → realistic, gives
     #           shunting (divisive) inhibition and voltage-dependent drive.
@@ -152,6 +168,37 @@ class NeuronParams:
     tau_nmda             : float = 100.0   # NMDA conductance decay (ms)
     nmda_ratio           : float =   0.5   # NMDA strength relative to AMPA
     Mg                   : float =   1.0   # extracellular [Mg²⁺] (mM)
+
+    # ── Inhibitory plasticity (iSTDP; Vogels et al. 2011) ──
+    # A symmetric plasticity rule on inhibitory→postsynaptic synapses that grows
+    # inhibition onto over-active cells and shrinks it onto quiet ones, driving
+    # each postsynaptic neuron toward `rho_target` Hz — detailed E/I balance.
+    # Stabilises STDP/reward learning (a fix for runaway excitation). Opt-in.
+    enable_istdp         : bool  = False
+    eta_istdp            : float =  0.001  # inhibitory learning rate
+    tau_istdp            : float = 20.0    # iSTDP trace time constant (ms)
+    rho_target           : float =  5.0    # target postsynaptic firing rate (Hz)
+
+    # ── Dendritic computation (two-compartment soma + active dendrite) ──
+    # Real pyramidal neurons are not points: excitation arrives on dendrites that
+    # integrate it nonlinearly and fire regenerative NMDA/Ca²⁺ "dendritic spikes"
+    # (plateau potentials), which then drive the soma — making a single neuron a
+    # two-layer computation (Poirazi & Mel 2003; Larkum 2013). Here excitation
+    # (incl. NMDA) charges a separate dendritic compartment coupled to the soma;
+    # inhibition stays perisomatic (PV⁺ basket cells). Opt-in.
+    enable_dendrite      : bool  = False
+    tau_d                : float = 25.0    # dendritic membrane time constant (ms)
+    g_couple             : float =  1.0    # soma↔dendrite coupling conductance
+    V_d_thresh           : float = -40.0   # dendritic-spike threshold (mV)
+    dend_plateau         : float =  3.0    # plateau (dendritic-spike) drive
+    tau_dend_spike       : float = 40.0    # plateau / dendritic-spike duration (ms)
+
+    # ── Gap junctions (electrical synapses between interneurons) ──
+    # Bidirectional ohmic coupling I_gap = g_gap·Σ(V_j − V_i) over coupled pairs;
+    # synchronises fast-spiking interneurons and sharpens gamma (Galarreta &
+    # Hestrin 1999). Wired by cortex.py among FS cells. Opt-in.
+    enable_gap           : bool  = False
+    g_gap                : float =  0.02   # gap-junction conductance (per coupled pair)
 
     # ── Connectivity backend ──
     # False: dense [N,N] weight matrix (simple, fine to a few thousand neurons).
@@ -245,6 +292,9 @@ class SynapseMatrix:
         # built only when enable_reward_learning is on (it is another [N,N]).
         self.elig = None
 
+        # Inhibitory-STDP trace, per neuron (Vogels et al. 2011)
+        self.istdp_trace = torch.zeros(N, device=device)
+
     def add_synapse(self, pre: int, post: int, weight: Optional[float] = None):
         """Form a new synapse from neuron pre → post."""
         if pre == post:
@@ -269,6 +319,12 @@ class SynapseMatrix:
         self.W[pre, post]    = weights
         self.mask[pre, post] = True
         self.age[pre, post]  = 0.0
+
+    def clear(self):
+        """Remove all synapses (e.g. to build structured connectivity from scratch)."""
+        self.W.zero_(); self.mask.zero_(); self.age.zero_()
+        if self.elig is not None:
+            self.elig.zero_()
 
     def remove_synapse(self, pre: int, post: int):
         self.W[pre, post]    = 0.0
@@ -388,6 +444,27 @@ class SynapseMatrix:
             self.W = self.W * (1.0 - p.cort_atrophy * modulator.cortisol * dt_ms)
         self.W = self.W * self.mask.float()
 
+    def apply_istdp(self, spikes: torch.Tensor, dt: float, is_inh: torch.Tensor):
+        """
+        Inhibitory STDP (Vogels et al. 2011). A symmetric rule on inhibitory→post
+        synapses that drives each postsynaptic neuron toward `rho_target`: when a
+        target is over-active its inhibition is strengthened, when quiet it is
+        weakened (a baseline depression −α), establishing detailed E/I balance.
+        is_inh : [N] bool — which presynaptic neurons are inhibitory.
+        """
+        p = self.params
+        dt_ms = dt * 1000.0
+        self.istdp_trace = self.istdp_trace * float(np.exp(-dt_ms / p.tau_istdp))
+        alpha = 2.0 * (p.rho_target / 1000.0) * p.tau_istdp     # depression offset
+        inh = is_inh.float()
+        # presynaptic (inhibitory) spike: Δw[i,j] += η·(trace[j] − α)
+        t1 = (spikes * inh).unsqueeze(1) * (self.istdp_trace.unsqueeze(0) - alpha)
+        # postsynaptic spike: Δw[i,j] += η·trace[i]   (inhibitory i only)
+        t2 = (inh * self.istdp_trace).unsqueeze(1) * spikes.unsqueeze(0)
+        self.W = (self.W + p.eta_istdp * (t1 + t2) * self.mask.float()).clamp(p.w_min, p.w_max)
+        self.W = self.W * self.mask.float()
+        self.istdp_trace = self.istdp_trace + spikes
+
     def homeostatic_scale(self, firing_rate_hz: torch.Tensor,
                           target_hz: float, eta: float):
         """
@@ -488,10 +565,25 @@ class NeuronPopulation:
         # Spike-frequency adaptation current (AHP / M-current, K+)
         self.w_adapt = torch.zeros(N, device=device)
 
+        # Dendritic compartment (two-compartment model): voltage + plateau timer
+        self.V_d = torch.full((N,), params.V_rest, device=device)
+        self.dend_timer = torch.zeros(N, device=device)   # ms left of a dendritic spike
+
         # Axonal conduction-delay state (lazily built on first step — needs dt)
         self._delay_buf   = None   # [L, N] ring buffer of emitted spikes
         self._delay_steps = None   # [N]    per-neuron axonal delay, in steps
         self._delay_wptr  = 0
+
+        # Per-neuron parameter overrides for cell-type heterogeneity (None → use
+        # the scalar NeuronParams value). Set via set_cell_params() / cortex.py.
+        self.tau_m_vec    = None   # [N] membrane time constant (ms)
+        self.t_ref_vec    = None   # [N] absolute refractory period (ms)
+        self.b_adapt_vec  = None   # [N] spike-triggered adaptation increment
+        self.V_thresh_vec = None   # [N] firing threshold (mV)
+
+        # Gap-junction (electrical synapse) directed pair list (None = none).
+        self.gap_pre  = None       # [G] long
+        self.gap_post = None       # [G] long
 
         # Dale's Law: assign neuron types
         n_inh = int(N * params.inhibitory_fraction)
@@ -510,6 +602,35 @@ class NeuronPopulation:
 
         # Firing rate tracker (exponential moving average)
         self.firing_rate = torch.zeros(N, device=device)
+
+    def set_cell_params(self, is_inhibitory=None, tau_m=None, t_ref=None,
+                        b_adapt=None, V_thresh=None):
+        """
+        Assign per-neuron (cell-type) parameters. Each argument is a [N] tensor,
+        or None to leave that parameter at the scalar NeuronParams default. Used
+        by cortex.py to give fast-spiking interneurons their distinct, fast,
+        non-adapting dynamics, etc.
+        """
+        if is_inhibitory is not None:
+            self.is_inhibitory = is_inhibitory.to(self.device).bool()
+            self.sign = torch.where(self.is_inhibitory,
+                                    torch.tensor(-1.0, device=self.device),
+                                    torch.tensor( 1.0, device=self.device))
+        if tau_m    is not None: self.tau_m_vec    = tau_m.to(self.device).float()
+        if t_ref    is not None: self.t_ref_vec    = t_ref.to(self.device).float()
+        if b_adapt  is not None: self.b_adapt_vec  = b_adapt.to(self.device).float()
+        if V_thresh is not None: self.V_thresh_vec = V_thresh.to(self.device).float()
+
+    def set_gap_junctions(self, pairs):
+        """
+        Wire electrical synapses. `pairs` is a list/array of undirected (a, b)
+        index pairs; each is stored in both directions so coupling is symmetric.
+        """
+        pairs = np.asarray(list(pairs), dtype=np.int64).reshape(-1, 2)
+        a, b = pairs[:, 0], pairs[:, 1]
+        pre  = np.concatenate([a, b]); post = np.concatenate([b, a])
+        self.gap_pre  = torch.tensor(pre,  device=self.device)
+        self.gap_post = torch.tensor(post, device=self.device)
 
     def step(self, I_ext: torch.Tensor, synapses: SynapseMatrix,
              dt: float) -> torch.Tensor:
@@ -538,33 +659,76 @@ class NeuronPopulation:
         if p.enable_nmda:
             self.g_nmda = self.g_nmda * float(np.exp(-dt_ms / p.tau_nmda))
 
+        # Per-neuron (cell-type) parameter overrides, falling back to scalars.
+        tau_m_   = self.tau_m_vec    if self.tau_m_vec    is not None else p.tau_m
+        b_adapt_ = self.b_adapt_vec  if self.b_adapt_vec  is not None else p.b_adapt
+        V_thr_   = self.V_thresh_vec if self.V_thresh_vec is not None else p.V_thresh
+        t_ref_   = (self.t_ref_vec if self.t_ref_vec is not None
+                    else torch.tensor(p.t_ref, device=self.device))
+
         # ── Membrane integration ──
         # Modulate tau_m by serotonin (calm = slower integration)
-        tau_m_eff = p.tau_m * mod.serotonin
+        tau_m_eff = tau_m_ * mod.serotonin
 
         # Leak current
         I_leak = (p.V_rest - self.V) / tau_m_eff
 
-        # Synaptic current — conductance-based (reversal potentials, with
-        # shunting inhibition) or the simpler current-based net g_e − g_i.
-        if p.conductance_based:
-            I_syn = (self.g_e * (p.E_exc - self.V) +
-                     self.g_i * (p.E_inh - self.V)) / p.C_m
+        if p.enable_dendrite:
+            # ── Two-compartment: excitation (+NMDA) → dendrite, inhibition → soma ──
+            # Excitatory drive integrated on the dendritic compartment.
+            I_exc_d = (self.g_e * (p.E_exc - self.V_d)) if p.conductance_based else self.g_e
+            if p.enable_nmda:
+                B_d = 1.0 / (1.0 + p.Mg * torch.exp(-0.062 * self.V_d) / 3.57)
+                I_exc_d = I_exc_d + p.nmda_ratio * self.g_nmda * B_d * (p.E_exc - self.V_d)
+            dend_active = self.dend_timer > 0
+            I_plateau = torch.where(dend_active,
+                                    torch.full_like(self.V_d, p.dend_plateau),
+                                    torch.zeros_like(self.V_d))
+            I_leak_d = (p.V_rest - self.V_d) / p.tau_d
+            dV_d = (I_leak_d + I_exc_d / p.C_m
+                    + p.g_couple * (self.V - self.V_d) + I_plateau) * dt_ms
+            self.V_d = (self.V_d + dV_d).clamp(max=p.V_peak)
+            # Regenerative dendritic spike: V_d crossing threshold opens a plateau.
+            trig = (self.V_d >= p.V_d_thresh) & (~dend_active)
+            self.dend_timer = torch.where(
+                trig, torch.full_like(self.dend_timer, p.tau_dend_spike),
+                (self.dend_timer - dt_ms).clamp(min=0.0))
+            # Soma sees perisomatic inhibition + coupling from the dendrite.
+            I_syn = (-self.g_i / p.C_m) + p.g_couple * (self.V_d - self.V)
         else:
-            I_syn = (self.g_e - self.g_i) / p.C_m
-
-        # Slow NMDA current: voltage-gated by Mg²⁺ block (Jahr & Stevens 1990).
-        # Near rest the channel is blocked (B≈0); depolarisation relieves it.
-        if p.enable_nmda:
-            B = 1.0 / (1.0 + p.Mg * torch.exp(-0.062 * self.V) / 3.57)
-            I_syn = I_syn + p.nmda_ratio * self.g_nmda * B * (p.E_exc - self.V) / p.C_m
+            # Single-compartment: conductance- or current-based net synaptic input.
+            if p.conductance_based:
+                I_syn = (self.g_e * (p.E_exc - self.V) +
+                         self.g_i * (p.E_inh - self.V)) / p.C_m
+            else:
+                I_syn = (self.g_e - self.g_i) / p.C_m
+            # Slow NMDA current: voltage-gated by Mg²⁺ block (Jahr & Stevens 1990).
+            if p.enable_nmda:
+                B = 1.0 / (1.0 + p.Mg * torch.exp(-0.062 * self.V) / 3.57)
+                I_syn = I_syn + p.nmda_ratio * self.g_nmda * B * (p.E_exc - self.V) / p.C_m
 
         # Spike-frequency adaptation: a hyperpolarising K+ current that grows
         # with each spike and decays with tau_w (Brette & Gerstner 2005).
         I_adapt = (self.w_adapt / p.C_m) if p.enable_adaptation else 0.0
 
+        # AdEx exponential spike-initiation term: a sharp, voltage-dependent
+        # upstroke that activates near V_T (Brette & Gerstner 2005).
+        if p.enable_exp:
+            I_exp = (p.delta_T / tau_m_eff) * torch.exp(
+                ((self.V - p.V_T) / p.delta_T).clamp(max=20.0))
+        else:
+            I_exp = 0.0
+
+        # Gap junctions: diffusive electrical coupling I_gap = g_gap·Σ(V_j − V_i).
+        if p.enable_gap and self.gap_pre is not None and self.gap_pre.numel() > 0:
+            diff = self.V[self.gap_post] - self.V[self.gap_pre]
+            I_gap = torch.zeros(self.N, device=self.device).index_add_(
+                0, self.gap_pre, p.g_gap * diff)
+        else:
+            I_gap = 0.0
+
         # Deterministic drift, integrated over dt
-        dV_det = (I_leak + I_syn - I_adapt + I_ext) * dt_ms
+        dV_det = (I_leak + I_exp + I_syn - I_adapt + I_gap + I_ext) * dt_ms
 
         # Thermal / background noise (norepinephrine scales arousal noise).
         # Stochastic term scales as √dt (Euler–Maruyama) when enabled, else dt.
@@ -574,23 +738,28 @@ class NeuronPopulation:
 
         # Total integration
         dV = dV_det + dV_noise
-        self.V = torch.where(in_ref, torch.tensor(p.V_reset, device=self.device), self.V + dV)
+        V_new = self.V + dV
+        if p.enable_exp:
+            V_new = V_new.clamp(max=p.V_peak)        # cap the exponential runaway
+        self.V = torch.where(in_ref, torch.tensor(p.V_reset, device=self.device), V_new)
 
         # ── Spike detection ──
-        # Threshold modulated by norepinephrine (arousal lowers threshold)
-        V_thresh_eff = p.V_thresh - (mod.norepinephrine - 1.0) * 3.0
-        spikes = (self.V >= V_thresh_eff) & (~in_ref)
+        if p.enable_exp:
+            # AdEx: the exponential drives V to V_peak; detect the spike there.
+            spikes = (self.V >= p.V_peak) & (~in_ref)
+        else:
+            # Threshold modulated by norepinephrine (arousal lowers threshold)
+            V_thresh_eff = V_thr_ - (mod.norepinephrine - 1.0) * 3.0
+            spikes = (self.V >= V_thresh_eff) & (~in_ref)
 
         # ── Post-spike reset ──
         self.V        = torch.where(spikes, torch.tensor(p.V_reset, device=self.device), self.V)
-        self.ref_count = torch.where(spikes,
-                                     torch.tensor(p.t_ref, device=self.device),
-                                     self.ref_count)
+        self.ref_count = torch.where(spikes, t_ref_, self.ref_count)
 
         # ── Adaptation update: relax toward a*(V−V_rest), kick by b on a spike ──
         if p.enable_adaptation:
             dw = (p.a_adapt * (self.V - p.V_rest) - self.w_adapt) / p.tau_w
-            self.w_adapt = self.w_adapt + dw * dt_ms + spikes.float() * p.b_adapt
+            self.w_adapt = self.w_adapt + dw * dt_ms + spikes.float() * b_adapt_
 
         # ── Propagate spikes via synapses ──
         # Each firing neuron injects current scaled by its sign (Dale's Law)
@@ -1177,6 +1346,10 @@ class BrainNet:
         # ── STDP weight updates ──
         self.synapses.apply_stdp(spikes.float(), dt, self.modulator)
 
+        # ── Inhibitory plasticity (detailed E/I balance) ──
+        if self.params.enable_istdp:
+            self.synapses.apply_istdp(spikes.float(), dt, self.population.is_inhibitory)
+
         # ── Three-factor consolidation: dopamine/cortisol gate eligibility ──
         if self.params.enable_reward_learning:
             self.synapses.apply_neuromodulation(self.modulator, dt)
@@ -1407,6 +1580,7 @@ class BrainNet:
         """Save full network state (works for both dense and sparse backends)."""
         torch.save({
             'V'             : self.population.V,
+            'V_d'           : self.population.V_d,
             'w_adapt'       : self.population.w_adapt,
             'g_nmda'        : self.population.g_nmda,
             'firing_rate'   : self.population.firing_rate,
@@ -1421,6 +1595,7 @@ class BrainNet:
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
         self.population.V = ckpt['V']
+        if 'V_d'         in ckpt: self.population.V_d         = ckpt['V_d']
         if 'w_adapt'     in ckpt: self.population.w_adapt     = ckpt['w_adapt']
         if 'g_nmda'      in ckpt: self.population.g_nmda      = ckpt['g_nmda']
         if 'firing_rate' in ckpt: self.population.firing_rate = ckpt['firing_rate']

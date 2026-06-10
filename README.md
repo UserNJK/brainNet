@@ -59,6 +59,41 @@ For richer experiments, [`neurochemistry.py`](src/neurochemistry.py) provides a 
 
 ---
 
+## System Architecture — how it all wires together
+
+The mechanisms above are not a loose toolbox; they are assembled by a single **composition root**, `BrainNet` ([`core.py`](src/core.py)). `BrainNet.__init__` instantiates one of every subsystem as an attribute, and `BrainNet.step()` drives them in a fixed order each timestep. Every subsystem is reachable only *through* `BrainNet` — it is the hub the rest of the library (the closed-loop harness, the cortex builder, the awareness battery) routes through.
+
+```
+            I_ext ──▶  ┌─────────────────────────┐  ──▶  (spikes, state)
+                       │        BrainNet          │
+                       │   composition root +     │
+                       │   per-step orchestrator  │
+                       └────────────┬─────────────┘
+                                    │ owns + drives
+   ┌──────────────┬─────────────────┼──────────────┬───────────────────┐
+   │              │                 │              │                   │
+ NeuronPopulation │            self.synapses     GrowthCone       analyzers:
+ (LIF dynamics)   │         ┌────────┴────────┐  (axon growth)  Oscillation /
+                  │      SynapseMatrix   SparseSynapses          Criticality /
+            self.modulator (dense [N,N])  (edge-list)           ThoughtDetector
+        ┌─────────┴─────────┐
+ NeuromodulatorState   Neurochemistry
+   (5 control axes)   (full chemical system)
+```
+
+**Two pluggability axes sit behind one uniform API.** This is the load-bearing design decision — both axes are swapped by what you pass to the constructor, and nothing downstream changes:
+
+| Axis | Default | Alternative | Selected by | Verified equivalent |
+|---|---|---|---|---|
+| **Connectivity backend** (`self.synapses`) | `SynapseMatrix` — dense `[N,N]` | `SparseSynapses` — edge-list, O(E) | `params.sparse_synapses` | [RESULTS §3](docs/RESULTS.md) — identical spike trains, 0.0 STDP diff |
+| **Neuromodulation** (`self.modulator`) | `NeuromodulatorState` — 5 scalars | `Neurochemistry` — kinetic chemical system | `neurochem=` constructor arg | [RESULTS §5](docs/RESULTS.md) — axis read/write compatible drop-in |
+
+Both alternatives expose the *same interface* as the default (`SparseSynapses`/`SynapseMatrix` share `apply_stdp` / `apply_istdp` / `apply_neuromodulation` / `add_synapses_bulk`; `Neurochemistry` exposes the same control axes as `NeuromodulatorState`), so `step()` calls them without knowing which is in place. That is exactly why `test_sparse_matches_dense()` is the most load-bearing regression test in the suite — it pins the equivalence the architecture relies on.
+
+**Per-step dataflow** (`BrainNet.step()`): `population.step()` (LIF integration + spikes) → `synapses.apply_stdp()` → `synapses.apply_istdp()` *(if enabled)* → `synapses.apply_neuromodulation()` *(if reward learning enabled)* → `modulator.step()` (chemical kinetics) → oscillation / criticality / thought analyzers update the returned `state`. The neuromodulator and synapse objects are the only state shared across stages, which keeps the three-factor reward path (dopamine/cortisol → eligibility traces) cleanly decoupled from the integration core.
+
+---
+
 ## Biophysical Options
 
 Several mechanisms are configurable on `NeuronParams`. Adaptation is on by default (it is nearly universal in cortex and improves stability); the rest default **off** so existing experiments reproduce bit-for-bit until you opt in.
@@ -71,6 +106,10 @@ Several mechanisms are configurable on `NeuronParams`. Adaptation is on by defau
 | `enable_homeostasis` | `False` | Homeostatic synaptic scaling toward `target_rate_hz` |
 | `enable_stp` | `False` | Short-term plasticity (`U_stp`, `tau_rec`, `tau_facil`); defaults to a facilitating synapse |
 | `enable_nmda` | `False` | Slow voltage-gated NMDA conductance (`tau_nmda`, `nmda_ratio`, `Mg`) |
+| `enable_exp` | `False` | AdEx exponential spike-initiation term (`delta_T`, `V_T`) — sharp upstroke + tonic/adapting/bursting firing patterns |
+| `enable_istdp` | `False` | Inhibitory STDP (Vogels 2011) — inhibition learns to balance excitation toward `rho_target` Hz |
+| `enable_gap` | `False` | Gap junctions / electrical synapses (`g_gap`); wired among FS interneurons by `cortex.py` |
+| `enable_dendrite` | `False` | Two-compartment neuron: excitation (+NMDA) charges a separate active dendrite with regenerative spikes (`tau_d`, `g_couple`, `V_d_thresh`, `dend_plateau`) → supralinear dendritic computation |
 | `noise_sqrt_dt` | `False` | Proper Euler–Maruyama (√dt) noise scaling — modest `noise_std` then drives realistic spontaneous activity |
 | `sparse_synapses` | `False` | Edge-list connectivity backend (O(E) memory/compute) instead of the dense `[N,N]` matrix — scales past the few-thousand-neuron ceiling |
 | `enable_reward_learning` | `False` | Three-factor reward/stress learning: eligibility traces gated by dopamine (`reward()`) and cortisol (`punish()`) — see below |
@@ -91,6 +130,7 @@ The package is split so heavy users can compose and extend pieces independently:
 | [`sparse_synapses.py`](src/sparse_synapses.py) | Edge-list connectivity backend for scaling past the dense `[N,N]` ceiling (`sparse_synapses=True`) |
 | [`neurochemistry.py`](src/neurochemistry.py) | Extensible neurochemical system (below) |
 | [`closed_loop.py`](src/closed_loop.py) | Closed-loop task harness — learning from self-generated feedback (below) |
+| [`cortex.py`](src/cortex.py) | Cell types (fast-spiking interneurons) + cortical E–I microcircuit → gamma (below) |
 
 ### Neurochemistry
 
@@ -121,7 +161,23 @@ early, late, log = demo_conditioning(n_trials=150)   # ≈0.30 → 1.00 response
 
 `demo_conditioning` (operant conditioning, Fetz 1969) reliably learns: the network is rewarded when its own target output crosses threshold, and reward-gated plasticity ratchets that pathway up until it responds on cue. Requires `enable_reward_learning=True`.
 
-> Two findings worth knowing. (1) **Reward-only vs. reward+punish:** because the learning signal is `M = (dopamine−1) − cortisol` and cortisol clears slowly, frequent errors keep cortisol elevated and *cancel* subsequent reward — a realistic "chronic stress blocks reward learning" effect, so simple conditioning uses positive reinforcement only. (2) `demo_discrimination` (2-alternative forced choice) currently sits at chance from scratch: without winner-take-all competition the output groups co-fire, so reward and punishment tag the same eligible synapses and cancel. Adding lateral inhibition between output groups is the next step.
+`demo_discrimination` learns a 2-alternative forced choice (climbing to **~0.85** accuracy) once three ingredients are combined: **winner-take-all** lateral inhibition between output groups (so only the winner is eligible), a dopamine **reward-prediction-error** baseline (so correct/wrong don't cancel), and a dedicated plastic **input→output projection** (so credit isn't buried in recurrent noise). It then shows a late instability typical of unregulated R-STDP — `enable_homeostasis=True` is the intended stabilizer.
+
+> Two findings worth knowing. (1) **Reward-only vs. reward+punish:** because the learning signal is `M = (dopamine−1) − cortisol` and cortisol clears slowly, frequent errors keep cortisol elevated and *cancel* subsequent reward — a realistic "chronic stress blocks reward learning" effect, so simple conditioning uses positive reinforcement only. (2) For trial-by-trial RL the wrong-signal is better modeled as a fast dopamine *dip* (RPE) than as slow cortisol — see `feedback(..., use_cortisol=False)`.
+
+### Structured Cortex
+
+`cortex.py` replaces the homogeneous random soup with a model of cortex: distinct **cell types** (each with its own intrinsic dynamics — fast-spiking PV⁺ interneurons are fast and non-adapting, regular-spiking pyramidal cells are slow and strongly adapting) wired by the canonical **E–I microcircuit**, optionally in **columns**.
+
+```python
+from cortex import build_cortex, demo_gamma
+brain = build_cortex(N=800, columns=4)
+demo_gamma()   # drive the excitatory cells → a gamma-band rhythm emerges
+```
+
+The payoff is biological: fast feedback inhibition from FS interneurons generates **gamma oscillations via the PING mechanism** (Cardin et al. 2009) — measured by the `OscillationAnalyzer` as a dominant gamma band, with FS interneurons firing at ~160 Hz vs ~54 Hz for pyramidal cells. This is the first emergent rhythm a random network cannot produce. Per-neuron heterogeneity is exposed generally via `NeuronPopulation.set_cell_params(...)`.
+
+See [`docs/RESULTS.md`](docs/RESULTS.md) for the full test record and [`docs/HARDWARE.md`](docs/HARDWARE.md) for the scaling / "what hardware runs a bare consciousness" analysis.
 
 ---
 
@@ -183,6 +239,9 @@ print(brain.get_thoughts())  # current cell assemblies
 - Beggs & Plenz (2003) — Neuronal avalanches / self-organized criticality
 - Softky & Koch (1993); Brunel (2000) — Irregular firing & the asynchronous-irregular cortical state
 - Buzsáki & Draguhn (2004) — Neuronal oscillations in cortical networks
+- Cardin et al. (2009); Buzsáki & Wang (2012) — Fast-spiking interneurons and gamma (PING)
+- Naud et al. (2008) — AdEx firing patterns; Vogels et al. (2011) — Inhibitory plasticity & E/I balance; Galarreta & Hestrin (1999) — Electrical synapses between interneurons
+- Poirazi & Mel (2003); Larkum (2013); Polsky et al. (2004) — Dendritic computation, dendritic spikes, supralinear summation
 - Schultz et al. (1997) — Dopamine reward prediction error
 - Frémaux & Gerstner (2016); Izhikevich (2007); Legenstein et al. (2008) — Three-factor / reward-modulated STDP, eligibility traces, closed-loop reinforcement
 - Joëls & Krugers (2007) — Stress, glucocorticoids (cortisol) and synaptic plasticity

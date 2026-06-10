@@ -189,21 +189,41 @@ def demo_discrimination(n_trials: int = 300, N: int = 160, seed: int = 0,
     output groups makes the choice (and the eligible pathway) unambiguous, which
     is what lets the credit signal separate the two mappings. Returns
     (early_acc, late_acc, log).
+
+    Result (N=140, seed=1): accuracy rises from chance to ~0.85 mid-run, then
+    shows a late instability typical of *unregulated* R-STDP (positive feedback
+    + weight saturation). Track the per-batch curve, not just early/late. To
+    stabilize, add homeostasis (`enable_homeostasis=True`) — see RESULTS.md.
     """
     try:
         from .core import BrainNet, NeuronParams
     except ImportError:
         from core import BrainNet, NeuronParams
     device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    p = NeuronParams(enable_reward_learning=True, noise_std=2.0, noise_sqrt_dt=True,
+    p = NeuronParams(enable_reward_learning=True, noise_std=1.5, noise_sqrt_dt=True,
                      seek_interval=10**9, prune_interval=10**9,
                      neuromod_lr=0.08, tau_elig=300.0, w_max=2.0)
     brain = BrainNet(N=N, params=p, device=device, seed=seed)
-    brain.synapses.W *= 2.2     # responsive regime so inputs drive the outputs
+
+    in0, in1 = list(range(0, 20)), list(range(20, 40))
+    out0, out1 = list(range(40, 70)), list(range(70, 100))
+    # Dedicated PLASTIC sensorimotor projections: every input neuron projects to
+    # *both* output groups (initially symmetric). These dominate the eligibility
+    # trace, so the reward signal can shape which input drives which output —
+    # the discriminative pathway the random recurrent net lacked.
+    rng = np.random.default_rng(seed)
+    pre, post = [], []
+    for i in in0 + in1:
+        for j in out0 + out1:
+            if rng.random() < 0.7:
+                pre.append(i); post.append(j)
+    w = torch.empty(len(pre)).uniform_(0.15, 0.30)
+    brain.synapses.add_synapses_bulk(torch.tensor(pre), torch.tensor(post), w)
+
     loop = ClosedLoop(
         brain,
-        input_groups={0: range(0, 20), 1: range(20, 40)},
-        output_groups=[range(40, 70), range(70, 100)],
+        input_groups={0: in0, 1: in1},
+        output_groups=[out0, out1],
         stim_amp=6.0, stim_steps=60, response_steps=60, settle_steps=120,
         reward_mag=1.0, warmup_steps=300, wta_strength=wta_strength,
         reward_baseline=True,      # dopamine = reward-prediction-error (see ClosedLoop)

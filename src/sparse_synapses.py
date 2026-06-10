@@ -55,6 +55,9 @@ class SparseSynapses:
         # Kept aligned with the edge arrays; zero unless enable_reward_learning.
         self.elig = torch.empty(0, dtype=torch.float, device=device)
 
+        # Inhibitory-STDP trace, per neuron (Vogels et al. 2011)
+        self.istdp_trace = torch.zeros(N, device=device)
+
     # ── construction ──────────────────────────────────────────────
     def _lin(self, pre, post):
         return pre * self.N + post
@@ -102,6 +105,13 @@ class SparseSynapses:
         self.post = torch.cat([self.post, torch.tensor([post], device=self.device)])
         self.w    = torch.cat([self.w,    torch.tensor([weight], device=self.device)])
         self.elig = torch.cat([self.elig, torch.zeros(1, device=self.device)])
+
+    def clear(self):
+        """Remove all edges (e.g. to build structured connectivity from scratch)."""
+        self.pre  = torch.empty(0, dtype=torch.long,  device=self.device)
+        self.post = torch.empty(0, dtype=torch.long,  device=self.device)
+        self.w    = torch.empty(0, dtype=torch.float, device=self.device)
+        self.elig = torch.empty(0, dtype=torch.float, device=self.device)
 
     # ── hot path ──────────────────────────────────────────────────
     def propagate(self, spike_f: torch.Tensor) -> torch.Tensor:
@@ -162,6 +172,19 @@ class SparseSynapses:
         gain       = torch.where(fired, self.stp_u * self.stp_x, torch.zeros_like(self.stp_x))
         self.stp_x = torch.where(fired, self.stp_x - self.stp_u * self.stp_x, self.stp_x)
         return gain
+
+    def apply_istdp(self, spikes: torch.Tensor, dt: float, is_inh: torch.Tensor):
+        """Inhibitory STDP (Vogels et al. 2011) — see SynapseMatrix.apply_istdp."""
+        p = self.params
+        dt_ms = dt * 1000.0
+        self.istdp_trace = self.istdp_trace * float(np.exp(-dt_ms / p.tau_istdp))
+        if self.w.numel() > 0:
+            alpha = 2.0 * (p.rho_target / 1000.0) * p.tau_istdp
+            inh_edge = is_inh[self.pre].float()
+            t1 = spikes[self.pre] * inh_edge * (self.istdp_trace[self.post] - alpha)
+            t2 = inh_edge * self.istdp_trace[self.pre] * spikes[self.post]
+            self.w = (self.w + p.eta_istdp * (t1 + t2)).clamp(p.w_min, p.w_max)
+        self.istdp_trace = self.istdp_trace + spikes
 
     def homeostatic_scale(self, firing_rate_hz: torch.Tensor,
                           target_hz: float, eta: float):
