@@ -1,2 +1,61 @@
+# ── Python bytecode / caches ──
 __pycache__/
-graphify-out
+*.py[cod]
+*$py.class
+
+# ── Virtual environments ──
+env/
+venv/
+.venv/
+ENV/
+
+# ── Packaging / build (note: dist/ and bioneuron.egg-info/ are intentionally
+#    committed to ship the wheel — do NOT add them here) ──
+build/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# ── Test / coverage / type-check caches ──
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+
+# ── Knowledge graph output (regenerate with `graphify update .`) ──
+graphify-out/
+
+# ── Desire-battery generated artifacts (regenerate with run_desire_study.py;
+#    the finished Desire_Study_Report.pdf is kept, like the other report PDFs) ──
+src/desire_results.json
+docs/desire_study.json
+docs/desire_figs/
+
+# ── Secrets / credentials (precautionary — none are in the repo today; this
+#    keeps them from ever being committed by accident) ──
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+*_rsa
+secrets.*
+credentials.*
+*.sqlite
+*.sqlite3
+*.db
+
+# ── OS / editor cruft ──
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
